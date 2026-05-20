@@ -1,5 +1,2 @@
-cloudscraper
+requests
 beautifulsoup4
-gnews
-ddgs
-python-dateutil
