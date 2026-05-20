@@ -1,5 +1,5 @@
 cloudscraper
 beautifulsoup4
 gnews
-duckduckgo-search
+ddgs
 python-dateutil
