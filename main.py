@@ -1,306 +1,151 @@
 import os
-import json
-import time
-import logging
-import cloudscraper
-import html
-import re
-import random
-import concurrent.futures
-from urllib.parse import urlparse, urlunparse
-from datetime import datetime, timedelta, timezone
+import requests
 from bs4 import BeautifulSoup
-from ddgs import DDGS
-from gnews import GNews
-from dateutil import parser
+import re
+import time
 
-# --- CONFIGURATION ---
-CONFIG = {
-    'SEARCH_QUERY': 'ایران OR خاورمیانه OR آمریکا OR اسرائیل OR اقتصاد OR دلار OR فناوری OR هوش مصنوعی',
-    'TARGET_SOURCES': [
-        'iranintl.com', 'bbc.com/persian', 'radiofarda.com', 'independentpersian.com',
-        'dw.com/fa', 'euronews.com/pe', 'digiato.com', 'tejaratnews.com'
-    ],
-    'FILES': {
-        'NEWS': 'news_exclusive.json',
-    },
-    'TELEGRAM': {
-        'BOT_TOKEN': os.environ.get('BOT_TOKEN'), 
-        'CHANNEL_ID': os.environ.get('TARGET_CHANNEL') 
-    },
-    'TIMEOUT': 15, 
-    'MAX_WORKERS': 8, 
-    'AI_RETRIES': 2,
-    'MIN_IMPORTANCE': 3,
-    'MAX_NEWS_AGE_HOURS': 24,
-    'HISTORY_SIZE': 300
-}
+# ==========================================
+# تنظیمات اصلی ربات (دریافت از سکرت‌های گیت‌هاب)
+# ==========================================
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+TARGET_CHANNEL = os.environ.get('TARGET_CHANNEL')
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger()
+MAX_HISTORY = 100          
+CHECK_LAST_N_POSTS = 10    
+DUPLICATE_CHARS = 50 
 
-class ExclusiveNewsRadar:
-    def __init__(self):
-        self.scraper = cloudscraper.create_scraper(browser='chrome') 
-        self.existing_news = self._load_existing_news()
-        self.seen_urls = set()
-        self.seen_titles = set()
+# کلمات کلیدی برای تشخیص پست‌های تبلیغاتی
+AD_KEYWORDS = [
+    "تخفیف", "خرید", "فروش", "ارزان", "تبلیغات", "اسپانسر", "کلیک کنید", 
+    "ثبت نام", "کسب درآمد", "پراکسی", "proxy", "vpn", "فیلترشکن", 
+    "فیلتر شکن", "جهت سفارش", "لینک در بیو", "ارز دیجیتال", "ترید", "سیگنال رایگان"
+]
+# ==========================================
+
+def load_channels():
+    if not os.path.exists('channels.txt'):
+        print("Error: channels.txt not found!")
+        return []
+    with open('channels.txt', 'r', encoding='utf-8') as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+
+def get_history():
+    if not os.path.exists('history.txt'): 
+        return []
+    with open('history.txt', 'r', encoding='utf-8') as f:
+        return [line.strip() for line in f.readlines()]
+
+def save_history(history):
+    with open('history.txt', 'w', encoding='utf-8') as f:
+        for item in history[-MAX_HISTORY:]:
+            f.write(item.replace('\n', ' ') + '\n')
+
+def is_ad(text, channel):
+    text_lower = text.lower()
+    channel_lower = channel.lower()
+    
+    for keyword in AD_KEYWORDS:
+        if keyword in text_lower:
+            print(f"-> پست تبلیغاتی مسدود شد (دلیل: {keyword})")
+            return True
+    
+    text_without_self = text_lower.replace(f"@{channel_lower}", "").replace(f"t.me/{channel_lower}", "")
+    
+    if text_without_self.count('t.me/') > 1 or text_without_self.count('@') > 2:
+        print("-> پست تبلیغاتی مسدود شد (دلیل: تگ کانال‌های دیگر)")
+        return True
         
-        for item in self.existing_news:
-            if item.get('url'):
-                self.seen_urls.add(self._clean_url(item['url']))
-            if item.get('title_fa'):
-                self.seen_titles.add(self._normalize_text(item['title_fa']))
-                
-        # سیستم جستجوی جایگزین گوگل نیوز
-        self.gnews_fa = GNews(language='fa', country='IR', period='1d', max_results=5)
+    return False
 
-    def _clean_url(self, url):
-        if not url: return ""
-        try:
-            parsed = urlparse(url)
-            clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
-            return clean.rstrip('/')
-        except: return url
+def is_duplicate(new_text, history):
+    if not new_text or len(new_text) < 10: 
+        return True
+    
+    snippet = new_text[:DUPLICATE_CHARS].strip()
+    for old_text in history:
+        if snippet in old_text:
+            return True
+    return False
 
-    def _normalize_text(self, text):
-        if not text: return ""
-        return re.sub(r'\W+', '', text).lower()
-
-    def _load_existing_news(self):
-        if not os.path.exists(CONFIG['FILES']['NEWS']): return []
-        try:
-            with open(CONFIG['FILES']['NEWS'], 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data if isinstance(data, list) else []
-        except: return []
-
-    def fetch_duckduckgo(self, query):
-        results = []
-        try:
-            ddgs = DDGS()
-            ddg_gen = ddgs.news(keywords=query, region='wt-wt', safesearch="off", timelimit="d", max_results=7)
-            for r in ddg_gen:
-                results.append({
-                    'title': r.get('title'),
-                    'url': r.get('url'),
-                    'description': r.get('body'),
-                    'image': r.get('image'),
-                    'published date': r.get('date')
-                })
-        except Exception as e: 
-            logger.error(f"DDG Error for '{query}': {e}")
-        return results
-
-    def get_combined_news(self):
-        all_entries = []
-        sources = CONFIG['TARGET_SOURCES'].copy()
-        random.shuffle(sources) # بر هم زدن ترتیب سایت‌ها برای جلوگیری از شناسایی الگو توسط فایروال
+def send_to_telegram(text, image_url, video_url):
+    if not BOT_TOKEN or not TARGET_CHANNEL:
+        print("Error: BOT_TOKEN or TARGET_CHANNEL is missing from Secrets!")
+        return
         
-        for domain in sources: 
-            try:
-                logger.info(f"Searching news for: {domain}")
-                query = f"site:{domain} (ایران OR جنگ OR اقتصاد OR فناوری OR سیاسی)"
-                
-                # اولویت اول: جستجو در داک‌داک‌گو
-                site_res = self.fetch_duckduckgo(query)
-                
-                # اولویت دوم: اگر داک‌داک‌گو مسدود کرده بود، از گوگل نیوز استفاده کن
-                if not site_res:
-                    logger.info(f"DDG Ratelimit for {domain}. Switching to Google News Fallback...")
-                    gn_results = self.gnews_fa.get_news(f'site:{domain} ایران')
-                    for r in gn_results:
-                        site_res.append({
-                            'title': r.get('title'),
-                            'url': r.get('url'),
-                            'description': r.get('description'),
-                            'image': None,
-                            'published date': r.get('published date')
-                        })
-                        
-                all_entries.extend(site_res)
-                
-                # تاخیر تصادفی بین 5 تا 10 ثانیه برای دور زدن محدودیت‌های ربات‌ياب
-                time.sleep(random.uniform(5, 10))
-                
-            except Exception as e: 
-                logger.error(f"Search Failed for {domain}: {e}")
-                
-        return all_entries
-
-    def scrape_article_text(self, final_url, fallback_snippet):
-        try:
-            if final_url.lower().endswith('.pdf'): return fallback_snippet, None
-            resp = self.scraper.get(final_url, timeout=CONFIG['TIMEOUT'])
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]): tag.extract()
-            
-            og_img = soup.find("meta", property="og:image")
-            img_url = og_img["content"] if og_img else None
-
-            article_body = soup.find('div', class_=re.compile(r'(article|story|body|content|news-text)'))
-            if article_body:
-                text = article_body.get_text(separator=' ').strip()
-            else:
-                text = " ".join([p.get_text().strip() for p in soup.find_all('p')])
-            
-            clean_text = re.sub(r'\s+', ' ', text)
-            return clean_text[:1500] if len(clean_text) > 100 else fallback_snippet, img_url
-        except: return fallback_snippet, None
-
-    def analyze_with_ai(self, headline, full_text):
-        system_prompt = (
-            "You are a modern, smart, and exclusive news curator for a premium Persian Telegram channel. "
-            "You read news and summarize them for your audience.\n\n"
-            "RULES:\n"
-            "- Tone: Conversational, friendly, yet highly professional and accurate (خودمونی ولی تخصصی). Speak like a smart friend breaking down complex news.\n"
-            "- No Clichés: Avoid generic news phrases.\n"
-            "- Never mention the source or publisher.\n"
-            "- Summary: EXACTLY 1 or 2 highly impactful sentences. Get straight to the point.\n"
-            "- Title: Catchy, bold, and modern.\n"
-            "- Importance: Score 1 to 5.\n\n"
-            "JSON OUTPUT FORMAT STRICTLY:\n"
-            '{"title_fa": "Title", "summary": "Conversational summary.", "importance": integer, "tags": ["tag1", "tag2"]}'
-        )
-
-        for attempt in range(CONFIG['AI_RETRIES']):
-            try:
-                resp = self.scraper.post(
-                    "https://text.pollinations.ai/openai",
-                    json={
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"HEADLINE: {headline}\nTEXT: {full_text[:1000]}"}
-                        ],
-                        "temperature": 0.3,
-                        "jsonMode": True
-                    }, timeout=25
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if 'title_fa' in data and 'summary' in data: return data
-            except Exception as e:
-                logger.error(f"AI Error: {e}")
-        return None
-
-    def process_item(self, entry):
-        raw_title = entry.get('title', '').rsplit(' - ', 1)[0].strip()
-        final_url = entry.get('url')
-        clean_final_url = self._clean_url(final_url)
-
-        if clean_final_url in self.seen_urls or self._normalize_text(raw_title) in self.seen_titles:
-            return None
+    if len(text) > 1024 and (image_url or video_url):
+        text = text[:1020] + "..."
         
-        text, scraped_img = self.scrape_article_text(final_url, entry.get('description', raw_title))
-        best_image = scraped_img if scraped_img else entry.get('image')
-
-        ai = self.analyze_with_ai(raw_title, text)
-        if not ai: return None
-        
-        if int(ai.get('importance', 1)) < CONFIG['MIN_IMPORTANCE']:
-            return None 
-
-        try: ts = parser.parse(entry.get('published date')).timestamp()
-        except: ts = time.time()
-
-        return {
-            "title_fa": ai.get('title_fa', raw_title),
-            "summary": ai.get('summary', ''),
-            "tags": ai.get('tags', []),
-            "importance": int(ai.get('importance', 1)),
-            "url": final_url, 
-            "clean_url": clean_final_url, 
-            "image": best_image,
-            "timestamp": ts
-        }
-
-    def send_digest_to_telegram(self, items):
-        token = CONFIG['TELEGRAM']['BOT_TOKEN']
-        chat_id = CONFIG['TELEGRAM']['CHANNEL_ID']
-        if not token or not chat_id: return
-
-        for item in items:
-            title = html.escape(str(item.get('title_fa', '')))
-            summary = html.escape(str(item.get('summary', '')))
-            image_url = item.get('image')
-            
-            tags = item.get('tags', [])
-            tags_str = " ".join([f"#{t.replace(' ', '_')}" for t in set(tags)])
-
-            caption = (
-                f"⚡️ <b>{title}</b>\n\n"
-                f"💬 {summary}\n\n"
-                f"🏷 {tags_str}\n\n"
-                f"🆔 @khbr24"
-            )
-
-            payload = {
-                "chat_id": chat_id, 
-                "parse_mode": "HTML",
-                "caption": caption[:1024]
-            }
-
-            try:
-                if image_url and image_url.startswith('http'):
-                    api_url = f"https://api.telegram.org/bot{token}/sendPhoto"
-                    payload["photo"] = image_url
-                    resp = self.scraper.post(api_url, json=payload)
-                    if resp.status_code != 200: raise Exception("Photo fail")
-                else: raise Exception("No image")
-            except:
-                api_url = f"https://api.telegram.org/bot{token}/sendMessage"
-                payload.pop("photo", None)
-                payload.pop("caption", None)
-                payload["text"] = caption
-                payload["disable_web_page_preview"] = True
-                self.scraper.post(api_url, json=payload)
-            
-            time.sleep(1) 
-
-    def save_news(self, new_items):
-        all_news = new_items + self.existing_news
-        seen_u = set()
-        unique_news = []
-        for item in all_news:
-            u = item.get('clean_url')
-            if u and u not in seen_u:
-                seen_u.add(u)
-                unique_news.append(item)
-        
-        unique_news.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
-        final_list = unique_news[:CONFIG['HISTORY_SIZE']]
-        
-        with open(CONFIG['FILES']['NEWS'], 'w', encoding='utf-8') as f: 
-            json.dump(final_list, f, indent=4, ensure_ascii=False)
-        return final_list
-
-    def run(self):
-        logger.info(">>> Stable Fast Radar Started...")
-        results = self.get_combined_news()
-        candidates = []
-        
-        for item in results:
-            clean_u = self._clean_url(item.get('url', ''))
-            if clean_u in self.seen_urls: continue
-            candidates.append(item)
-
-        new_processed_items = []
-        if candidates:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG['MAX_WORKERS']) as exc:
-                futures = {exc.submit(self.process_item, i): i for i in candidates}
-                for fut in concurrent.futures.as_completed(futures):
-                    res = fut.result()
-                    if res:
-                        new_processed_items.append(res)
-                        self.seen_urls.add(res['clean_url'])
-
-        if new_processed_items:
-            self.existing_news = self.save_news(new_processed_items)
-            new_processed_items.sort(key=lambda x: x['importance'], reverse=True)
-            self.send_digest_to_telegram(new_processed_items)
-            logger.info(f">>> {len(new_processed_items)} items published.")
+    try:
+        if video_url:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+            payload = {"chat_id": TARGET_CHANNEL, "video": video_url, "caption": text}
+        elif image_url:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+            payload = {"chat_id": TARGET_CHANNEL, "photo": image_url, "caption": text}
         else:
-            logger.info(">>> No new valid items.")
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            payload = {"chat_id": TARGET_CHANNEL, "text": text[:4096]}
+            
+        response = requests.post(url, data=payload)
+        
+        if not response.json().get('ok'):
+            print(f"Telegram API Error: {response.text}")
+            
+        time.sleep(2) 
+    except Exception as e:
+        print(f"Error sending message: {e}")
+
+def main():
+    channels = load_channels()
+    if not channels:
+        return
+        
+    history = get_history()
+    new_posts = []
+
+    for channel in channels:
+        print(f"\nChecking {channel}...")
+        try:
+            r = requests.get(f"https://t.me/s/{channel}")
+            soup = BeautifulSoup(r.text, 'html.parser')
+            messages = soup.find_all('div', class_='tgme_widget_message')
+            
+            for msg in messages[-CHECK_LAST_N_POSTS:]:
+                text_div = msg.find('div', class_='tgme_widget_message_text')
+                text = text_div.get_text(separator='\n').strip() if text_div else ""
+                
+                if not text or is_ad(text, channel) or is_duplicate(text, history):
+                    continue
+                    
+                image_url = None
+                photo_wrap = msg.find('a', class_='tgme_widget_message_photo_wrap')
+                if photo_wrap:
+                    style = photo_wrap.get('style', '')
+                    match = re.search(r"background-image:url\('(.+?)'\)", style)
+                    if match: image_url = match.group(1)
+                    
+                video_url = None
+                video_wrap = msg.find('video', class_='tgme_widget_message_video')
+                if video_wrap:
+                    video_url = video_wrap.get('src')
+                    
+                new_posts.append({
+                    'text': text, 'image': image_url, 'video': video_url
+                })
+                history.append(text.replace('\n', ' '))
+                
+        except Exception as e:
+            print(f"Error checking {channel}: {e}")
+            
+    if new_posts:
+        print(f"\nSending {len(new_posts)} new posts to Telegram...")
+    else:
+        print("\nNo new valid posts found.")
+
+    for post in new_posts:
+        send_to_telegram(post['text'], post['image'], post['video'])
+        
+    save_history(history)
 
 if __name__ == "__main__":
-    ExclusiveNewsRadar().run()
+    main()
