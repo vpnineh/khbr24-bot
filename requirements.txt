@@ -1,2 +1,5 @@
-requests
+cloudscraper
 beautifulsoup4
+gnews
+duckduckgo_search
+python-dateutil
