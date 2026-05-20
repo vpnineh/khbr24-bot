@@ -26,9 +26,9 @@ CONFIG = {
         'BOT_TOKEN': os.environ.get('BOT_TOKEN'), 
         'CHANNEL_ID': os.environ.get('TARGET_CHANNEL') 
     },
-    'TIMEOUT': 20,
-    'MAX_WORKERS': 4,
-    'AI_RETRIES': 3,
+    'TIMEOUT': 15, # کاهش تایم‌اوت برای افزایش سرعت
+    'MAX_WORKERS': 8, # افزایش شدید مالتی‌تسکینگ (۸ پردازش همزمان)
+    'AI_RETRIES': 2,
     'MIN_IMPORTANCE': 3,
     'MAX_NEWS_AGE_HOURS': 24,
     'HISTORY_SIZE': 300
@@ -93,33 +93,18 @@ class ExclusiveNewsRadar:
                 query = f"site:{domain} (ایران OR جنگ OR اقتصاد OR فناوری OR سیاسی)"
                 site_res = self.fetch_duckduckgo(query)
                 all_entries.extend(site_res)
-                time.sleep(1) 
             except: pass
         return all_entries
 
     def scrape_article_text(self, final_url, fallback_snippet):
         try:
-            if final_url.lower().endswith('.pdf'): return fallback_snippet, None, None
-            resp = self.scraper.get(final_url, timeout=15)
+            if final_url.lower().endswith('.pdf'): return fallback_snippet, None
+            resp = self.scraper.get(final_url, timeout=CONFIG['TIMEOUT'])
             soup = BeautifulSoup(resp.text, 'html.parser')
             for tag in soup(["script", "style", "nav", "footer", "header", "aside"]): tag.extract()
             
-            # استخراج تصویر
             og_img = soup.find("meta", property="og:image")
             img_url = og_img["content"] if og_img else None
-
-            # استخراج ویدیو (در صورت وجود)
-            vid_url = None
-            og_vid = soup.find("meta", property="og:video") or soup.find("meta", property="og:video:url") or soup.find("meta", property="og:video:secure_url")
-            if og_vid and og_vid.get("content"):
-                vid_url = og_vid["content"]
-            else:
-                # جستجو برای تگ HTML5 ویدیو
-                vid_tag = soup.find("video")
-                if vid_tag and vid_tag.get("src"):
-                    vid_url = vid_tag["src"]
-                elif vid_tag and vid_tag.find("source"):
-                    vid_url = vid_tag.find("source").get("src")
 
             article_body = soup.find('div', class_=re.compile(r'(article|story|body|content|news-text)'))
             if article_body:
@@ -128,8 +113,8 @@ class ExclusiveNewsRadar:
                 text = " ".join([p.get_text().strip() for p in soup.find_all('p')])
             
             clean_text = re.sub(r'\s+', ' ', text)
-            return clean_text[:2000] if len(clean_text) > 100 else fallback_snippet, img_url, vid_url
-        except: return fallback_snippet, None, None
+            return clean_text[:1500] if len(clean_text) > 100 else fallback_snippet, img_url
+        except: return fallback_snippet, None
 
     def analyze_with_ai(self, headline, full_text):
         system_prompt = (
@@ -137,13 +122,13 @@ class ExclusiveNewsRadar:
             "You read news and summarize them for your audience.\n\n"
             "RULES:\n"
             "- Tone: Conversational, friendly, yet highly professional and accurate (خودمونی ولی تخصصی). Speak like a smart friend breaking down complex news.\n"
-            "- No Clichés: Avoid generic news phrases like 'به گزارش خبرگزاری ها' or 'بنابر اعلام'. Present it as exclusive info.\n"
+            "- No Clichés: Avoid generic news phrases.\n"
             "- Never mention the source or publisher.\n"
-            "- Summary: Write exactly ONE or TWO highly impactful, engaging sentences. Get straight to the point. What happened and why it matters.\n"
+            "- Summary: EXACTLY 1 or 2 highly impactful sentences. Get straight to the point.\n"
             "- Title: Catchy, bold, and modern.\n"
             "- Importance: Score 1 to 5.\n\n"
             "JSON OUTPUT FORMAT STRICTLY:\n"
-            '{"title_fa": "Title", "summary": "Conversational summary in 1-2 sentences.", "importance": integer, "tags": ["tag1", "tag2"]}'
+            '{"title_fa": "Title", "summary": "Conversational summary.", "importance": integer, "tags": ["tag1", "tag2"]}'
         )
 
         for attempt in range(CONFIG['AI_RETRIES']):
@@ -153,19 +138,17 @@ class ExclusiveNewsRadar:
                     json={
                         "messages": [
                             {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"HEADLINE: {headline}\nTEXT: {full_text[:1200]}"}
+                            {"role": "user", "content": f"HEADLINE: {headline}\nTEXT: {full_text[:1000]}"}
                         ],
                         "temperature": 0.3,
                         "jsonMode": True
-                    }, timeout=35
+                    }, timeout=25
                 )
-                
                 if resp.status_code == 200:
                     data = resp.json()
                     if 'title_fa' in data and 'summary' in data: return data
             except Exception as e:
                 logger.error(f"AI Error: {e}")
-                time.sleep(2)
         return None
 
     def process_item(self, entry):
@@ -176,8 +159,7 @@ class ExclusiveNewsRadar:
         if clean_final_url in self.seen_urls or self._normalize_text(raw_title) in self.seen_titles:
             return None
         
-        # دریافت متن، عکس و ویدیو
-        text, scraped_img, scraped_vid = self.scrape_article_text(final_url, entry.get('description', raw_title))
+        text, scraped_img = self.scrape_article_text(final_url, entry.get('description', raw_title))
         best_image = scraped_img if scraped_img else entry.get('image')
 
         ai = self.analyze_with_ai(raw_title, text)
@@ -197,7 +179,6 @@ class ExclusiveNewsRadar:
             "url": final_url, 
             "clean_url": clean_final_url, 
             "image": best_image,
-            "video": scraped_vid,
             "timestamp": ts
         }
 
@@ -210,12 +191,10 @@ class ExclusiveNewsRadar:
             title = html.escape(str(item.get('title_fa', '')))
             summary = html.escape(str(item.get('summary', '')))
             image_url = item.get('image')
-            video_url = item.get('video')
             
             tags = item.get('tags', [])
             tags_str = " ".join([f"#{t.replace(' ', '_')}" for t in set(tags)])
 
-            # کپشن اختصاصی با آیدی کانال شما
             caption = (
                 f"⚡️ <b>{title}</b>\n\n"
                 f"💬 {summary}\n\n"
@@ -229,41 +208,22 @@ class ExclusiveNewsRadar:
                 "caption": caption[:1024]
             }
 
-            sent = False
-            
             try:
-                # اولویت اول: تلاش برای ارسال ویدیو
-                if video_url and video_url.startswith('http'):
-                    api_url = f"https://api.telegram.org/bot{token}/sendVideo"
-                    payload["video"] = video_url
-                    resp = self.scraper.post(api_url, json=payload)
-                    if resp.status_code == 200:
-                        sent = True
-                    else:
-                        payload.pop("video", None)
-
-                # اولویت دوم: در صورت نبود ویدیو یا خطا در آپلود آن، ارسال عکس
-                if not sent and image_url and image_url.startswith('http'):
+                if image_url and image_url.startswith('http'):
                     api_url = f"https://api.telegram.org/bot{token}/sendPhoto"
                     payload["photo"] = image_url
                     resp = self.scraper.post(api_url, json=payload)
-                    if resp.status_code == 200:
-                        sent = True
-                    else:
-                        payload.pop("photo", None)
-
-                # اولویت سوم: اگر نه عکس بود نه ویدیو، ارسال به صورت متن خام
-                if not sent:
-                    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
-                    payload["text"] = caption
-                    payload.pop("caption", None)
-                    payload["disable_web_page_preview"] = True
-                    self.scraper.post(api_url, json=payload)
-
-            except Exception as e:
-                logger.error(f"Telegram Send Error: {e}")
+                    if resp.status_code != 200: raise Exception("Photo fail")
+                else: raise Exception("No image")
+            except:
+                api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+                payload.pop("photo", None)
+                payload.pop("caption", None)
+                payload["text"] = caption
+                payload["disable_web_page_preview"] = True
+                self.scraper.post(api_url, json=payload)
             
-            time.sleep(2) 
+            time.sleep(1) # کاهش تاخیر بین پیام‌ها
 
     def save_news(self, new_items):
         all_news = new_items + self.existing_news
@@ -283,7 +243,7 @@ class ExclusiveNewsRadar:
         return final_list
 
     def run(self):
-        logger.info(">>> Exclusive Radar Started...")
+        logger.info(">>> Fast Radar Started...")
         results = self.get_combined_news()
         candidates = []
         
@@ -294,6 +254,7 @@ class ExclusiveNewsRadar:
 
         new_processed_items = []
         if candidates:
+            # استفاده از پردازش موازی بالا (۸ تسک همزمان)
             with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG['MAX_WORKERS']) as exc:
                 futures = {exc.submit(self.process_item, i): i for i in candidates}
                 for fut in concurrent.futures.as_completed(futures):
@@ -306,9 +267,9 @@ class ExclusiveNewsRadar:
             self.existing_news = self.save_news(new_processed_items)
             new_processed_items.sort(key=lambda x: x['importance'], reverse=True)
             self.send_digest_to_telegram(new_processed_items)
-            logger.info(f">>> {len(new_processed_items)} items published to Telegram.")
+            logger.info(f">>> {len(new_processed_items)} items published.")
         else:
-            logger.info(">>> No new valid items found.")
+            logger.info(">>> No new valid items.")
 
 if __name__ == "__main__":
     ExclusiveNewsRadar().run()
