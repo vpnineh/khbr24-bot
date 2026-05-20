@@ -5,11 +5,13 @@ import logging
 import cloudscraper
 import html
 import re
+import random
 import concurrent.futures
 from urllib.parse import urlparse, urlunparse
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
+from ddgs import DDGS
+from gnews import GNews
 from dateutil import parser
 
 # --- CONFIGURATION ---
@@ -26,8 +28,8 @@ CONFIG = {
         'BOT_TOKEN': os.environ.get('BOT_TOKEN'), 
         'CHANNEL_ID': os.environ.get('TARGET_CHANNEL') 
     },
-    'TIMEOUT': 15, # کاهش تایم‌اوت برای افزایش سرعت
-    'MAX_WORKERS': 8, # افزایش شدید مالتی‌تسکینگ (۸ پردازش همزمان)
+    'TIMEOUT': 15, 
+    'MAX_WORKERS': 8, 
     'AI_RETRIES': 2,
     'MIN_IMPORTANCE': 3,
     'MAX_NEWS_AGE_HOURS': 24,
@@ -50,6 +52,9 @@ class ExclusiveNewsRadar:
             if item.get('title_fa'):
                 self.seen_titles.add(self._normalize_text(item['title_fa']))
                 
+        # سیستم جستجوی جایگزین گوگل نیوز
+        self.gnews_fa = GNews(language='fa', country='IR', period='1d', max_results=5)
+
     def _clean_url(self, url):
         if not url: return ""
         try:
@@ -83,17 +88,44 @@ class ExclusiveNewsRadar:
                     'image': r.get('image'),
                     'published date': r.get('date')
                 })
-        except Exception as e: logger.error(f"DDG Error: {e}")
+        except Exception as e: 
+            logger.error(f"DDG Error for '{query}': {e}")
         return results
 
     def get_combined_news(self):
         all_entries = []
-        for domain in CONFIG['TARGET_SOURCES']: 
+        sources = CONFIG['TARGET_SOURCES'].copy()
+        random.shuffle(sources) # بر هم زدن ترتیب سایت‌ها برای جلوگیری از شناسایی الگو توسط فایروال
+        
+        for domain in sources: 
             try:
+                logger.info(f"Searching news for: {domain}")
                 query = f"site:{domain} (ایران OR جنگ OR اقتصاد OR فناوری OR سیاسی)"
+                
+                # اولویت اول: جستجو در داک‌داک‌گو
                 site_res = self.fetch_duckduckgo(query)
+                
+                # اولویت دوم: اگر داک‌داک‌گو مسدود کرده بود، از گوگل نیوز استفاده کن
+                if not site_res:
+                    logger.info(f"DDG Ratelimit for {domain}. Switching to Google News Fallback...")
+                    gn_results = self.gnews_fa.get_news(f'site:{domain} ایران')
+                    for r in gn_results:
+                        site_res.append({
+                            'title': r.get('title'),
+                            'url': r.get('url'),
+                            'description': r.get('description'),
+                            'image': None,
+                            'published date': r.get('published date')
+                        })
+                        
                 all_entries.extend(site_res)
-            except: pass
+                
+                # تاخیر تصادفی بین 5 تا 10 ثانیه برای دور زدن محدودیت‌های ربات‌ياب
+                time.sleep(random.uniform(5, 10))
+                
+            except Exception as e: 
+                logger.error(f"Search Failed for {domain}: {e}")
+                
         return all_entries
 
     def scrape_article_text(self, final_url, fallback_snippet):
@@ -223,7 +255,7 @@ class ExclusiveNewsRadar:
                 payload["disable_web_page_preview"] = True
                 self.scraper.post(api_url, json=payload)
             
-            time.sleep(1) # کاهش تاخیر بین پیام‌ها
+            time.sleep(1) 
 
     def save_news(self, new_items):
         all_news = new_items + self.existing_news
@@ -243,7 +275,7 @@ class ExclusiveNewsRadar:
         return final_list
 
     def run(self):
-        logger.info(">>> Fast Radar Started...")
+        logger.info(">>> Stable Fast Radar Started...")
         results = self.get_combined_news()
         candidates = []
         
@@ -254,7 +286,6 @@ class ExclusiveNewsRadar:
 
         new_processed_items = []
         if candidates:
-            # استفاده از پردازش موازی بالا (۸ تسک همزمان)
             with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG['MAX_WORKERS']) as exc:
                 futures = {exc.submit(self.process_item, i): i for i in candidates}
                 for fut in concurrent.futures.as_completed(futures):
