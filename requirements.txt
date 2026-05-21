@@ -1,4 +1,6 @@
+numpy<2.0.0
+torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers==2.2.2
+transformers==4.35.0
 requests==2.31.0
 beautifulsoup4==4.12.2
-sentence-transformers==2.2.2
-torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
