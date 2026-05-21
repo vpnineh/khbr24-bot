@@ -21,7 +21,6 @@ TARGET_CHANNEL = os.environ.get('TARGET_CHANNEL')
 
 MAX_HISTORY = 150          
 CHECK_LAST_N_POSTS = 10    
-# افزایش به 0.92: یعنی خبرها باید 92 درصد شبیه هم باشند تا تکراری محسوب شوند (اجازه عبور خبرهای بیشتر)
 SIMILARITY_THRESHOLD = 0.92 
 
 AD_KEYWORDS = [
@@ -56,14 +55,18 @@ def get_history():
         return []
     try:
         with open('history.pkl', 'rb') as f:
-            return pickle.load(f)
+            data = pickle.load(f)
+            # فیلتر کردن مقادیر None در صورت وجود خرابی از اجراهای قبلی
+            return [emb for emb in data if emb is not None]
     except Exception as e:
         logger.error(f"خطا در خواندن فایل تاریخچه: {e}")
         return []
 
 def save_history(history_list):
+    # اطمینان از اینکه هیچ مقدار Noneای ذخیره نمی‌شود
+    clean_history = [emb for emb in history_list if emb is not None]
     with open('history.pkl', 'wb') as f:
-        pickle.dump(history_list[-MAX_HISTORY:], f)
+        pickle.dump(clean_history[-MAX_HISTORY:], f)
 
 def is_ad(text):
     text_lower = text.lower()
@@ -77,12 +80,15 @@ def is_ad(text):
     return False
 
 def is_semantically_duplicate(new_text, history_embeddings):
-    if not history_embeddings:
-        return False, None
-        
+    # همیشه در ابتدا بردار متن جدید را می‌سازیم
     new_embedding = model.encode(new_text, convert_to_tensor=True)
     
+    if not history_embeddings:
+        return False, new_embedding
+        
     for past_emb in history_embeddings:
+        if past_emb is None: # محافظت در برابر دیتای خراب
+            continue
         cosine_score = util.cos_sim(new_embedding, past_emb)[0][0].item()
         if cosine_score >= SIMILARITY_THRESHOLD:
             return True, new_embedding 
@@ -90,34 +96,23 @@ def is_semantically_duplicate(new_text, history_embeddings):
     return False, new_embedding
 
 def clean_and_format_text(text):
-    """پاکسازی فوق‌پیشرفته متن برای جلوگیری از فاصله‌های اضافه و حذف لینک‌ها"""
-    # جدا کردن خطوط بر اساس اینتر
     lines = text.split('\n')
     clean_lines = []
     
     for line in lines:
-        # اگر خط شامل کلمات اسپم بود، کاملا رد شود
         if any(spam in line for spam in SPAM_PHRASES):
             continue
             
-        # حذف آیدی‌ها و لینک‌های تلگرامی
         line = re.sub(r'@[a-zA-Z0-9_]+', '', line)
         line = re.sub(r'(https?://)?(www\.)?(t\.me|telegram\.me)/[^\s]+', '', line)
         
-        # حذف فاصله‌های خالی ابتدا و انتها
         line = line.strip()
-        
-        # فقط در صورتی که خط خالی نبود اضافه شود
         if line != "":
             clean_lines.append(line)
             
-    # چسباندن خطوط فقط با یک اینتر (جلوگیری از ایجاد فاصله‌های وحشتناک بین ایموجی و متن)
     pure_text = '\n'.join(clean_lines)
-    
-    # قالب و امضای نهایی شما
     footer = "\n━━━━━━━━━━━━\nاخبار دست اول ایران و جهان\n🆔 @VPNine1"
     
-    # مدیریت محدودیت ۱۰۲۴ کاراکتری کپشن
     max_len = 1024 - len(footer) - 5 
     if len(pure_text) > max_len:
         pure_text = pure_text[:max_len].rsplit(' ', 1)[0] + "..."
@@ -126,7 +121,7 @@ def clean_and_format_text(text):
 
 def send_to_telegram(text, image_url, video_url):
     if not BOT_TOKEN or not TARGET_CHANNEL:
-        logger.error("اطلاعات ربات (Token/Channel) در سکرت‌ها تنظیم نشده است!")
+        logger.error("اطلاعات ربات در سکرت‌ها تنظیم نشده است!")
         return False
         
     try:
@@ -155,7 +150,7 @@ def send_to_telegram(text, image_url, video_url):
             logger.error(f"خطای تلگرام: {result.get('description')}")
             return False
             
-        time.sleep(2) # وقفه برای جلوگیری از بلاک شدن ربات
+        time.sleep(2) 
         return True
     except Exception as e:
         logger.error(f"خطا در ارتباط با API تلگرام: {e}")
@@ -186,7 +181,6 @@ def main():
             
             for msg in messages[-CHECK_LAST_N_POSTS:]:
                 text_div = msg.find('div', class_='tgme_widget_message_text')
-                # استفاده از فاصله به جای اینتر برای جلوگیری از جدا شدن ایموجی‌ها در HTML اولیه
                 raw_text = text_div.get_text(separator='\n').strip() if text_div else ""
                 
                 if not raw_text or len(raw_text) < 20 or is_ad(raw_text):
@@ -216,7 +210,6 @@ def main():
                     'video': video_url,
                     'embedding': embedding
                 })
-                # اضافه کردن موقت به حافظه برای جلوگیری از ارسال دو خبر مشابه در یک اجرا
                 history_embeddings.append(embedding) 
                 
         except Exception as e:
